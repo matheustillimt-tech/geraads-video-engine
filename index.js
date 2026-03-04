@@ -8,7 +8,6 @@ const http = require("http");
 const app = express();
 app.use(express.json({ limit: "50mb" }));
 
-// Health check
 app.get("/", (req, res) => res.json({ status: "ok" }));
 
 app.post("/concat", async (req, res) => {
@@ -69,9 +68,11 @@ app.post("/concat", async (req, res) => {
     const ffArgs = ["-y"];
     inputPaths.forEach((p) => ffArgs.push("-i", p));
 
-    // Normalização de vídeo + áudio garantido (silêncio se faltar)
     let filter = "";
+    let concatInputs = ""; // <- VAI SER INTERCALADO [v0][a0][v1][a1]...
+
     for (let i = 0; i < metas.length; i++) {
+      // vídeo: pad + fps + formato + sar
       filter +=
         `[${i}:v]` +
         `scale=1080:1920:force_original_aspect_ratio=decrease,` +
@@ -79,6 +80,7 @@ app.post("/concat", async (req, res) => {
         `fps=30,format=yuv420p,setsar=1` +
         `[v${i}];`;
 
+      // áudio: se não tiver, cria silêncio com mesma duração
       if (metas[i].hasAudio) {
         filter +=
           `[${i}:a]` +
@@ -86,18 +88,19 @@ app.post("/concat", async (req, res) => {
           `aresample=async=1` +
           `[a${i}];`;
       } else {
-        // gera áudio silencioso com mesma duração do vídeo
         const dur = Math.max(0.1, metas[i].duration || 1);
         filter +=
           `anullsrc=channel_layout=stereo:sample_rate=44100,` +
           `atrim=0:${dur},asetpts=N/SR/TB` +
           `[a${i}];`;
       }
+
+      // ✅ MUITO IMPORTANTE: concatInputs INTERCALADO
+      concatInputs += `[v${i}][a${i}]`;
     }
 
-    const vInputs = metas.map((_, i) => `[v${i}]`).join("");
-    const aInputs = metas.map((_, i) => `[a${i}]`).join("");
-    filter += `${vInputs}${aInputs}concat=n=${metas.length}:v=1:a=1[vout][aout]`;
+    // ✅ concat correto (ordem intercalada)
+    filter += `${concatInputs}concat=n=${metas.length}:v=1:a=1[vout][aout]`;
 
     ffArgs.push(
       "-filter_complex", filter,
@@ -106,6 +109,7 @@ app.post("/concat", async (req, res) => {
       "-c:v", "libx264",
       "-preset", "veryfast",
       "-crf", "23",
+      "-pix_fmt", "yuv420p",
       "-c:a", "aac",
       "-b:a", "128k",
       "-ar", "44100",
@@ -124,11 +128,11 @@ app.post("/concat", async (req, res) => {
       return res.status(500).json({
         error: "FFmpeg processing failed",
         details: "ffmpeg exited with non-zero code",
-        ffmpeg_stderr_tail: stderrTail, // <-- isso mostra o erro real no Lovable
+        ffmpeg_stderr_tail: stderrTail,
       });
     }
 
-    // ===== DOWNLOAD RESPONSE =====
+    // ✅ força download (não abrir em nova aba)
     res.setHeader("Content-Type", "application/octet-stream");
     res.setHeader("Content-Disposition", `attachment; filename="${outName}.mp4"`);
 
@@ -156,12 +160,10 @@ function runSpawnCapture(cmd, args) {
       const s = String(d);
       console.log(s);
       stderr += s;
-      if (stderr.length > 20000) stderr = stderr.slice(-20000); // limita memória
+      if (stderr.length > 20000) stderr = stderr.slice(-20000);
     });
 
-    p.on("close", (code) => {
-      resolve({ code, stderrTail: stderr.slice(-4000) });
-    });
+    p.on("close", (code) => resolve({ code, stderrTail: stderr.slice(-4000) }));
   });
 }
 
@@ -170,7 +172,6 @@ function runSpawnToString(cmd, args) {
     const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     let err = "";
-
     p.stdout.on("data", (d) => (out += String(d)));
     p.stderr.on("data", (d) => (err += String(d)));
 
@@ -181,9 +182,7 @@ function runSpawnToString(cmd, args) {
   });
 }
 
-// Usa ffprobe pra detectar áudio e duração
 async function probeFile(filePath) {
-  // duração
   const durStr = await runSpawnToString("ffprobe", [
     "-v", "error",
     "-show_entries", "format=duration",
@@ -193,7 +192,6 @@ async function probeFile(filePath) {
 
   const duration = Math.max(0, parseFloat(String(durStr).trim()) || 0);
 
-  // tem áudio?
   const audioStr = await runSpawnToString("ffprobe", [
     "-v", "error",
     "-select_streams", "a:0",
@@ -203,7 +201,6 @@ async function probeFile(filePath) {
   ]).catch(() => "");
 
   const hasAudio = String(audioStr).trim().length > 0;
-
   return { duration, hasAudio };
 }
 
