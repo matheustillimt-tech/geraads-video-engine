@@ -1,235 +1,294 @@
+/**
+ * GeraAds Video Engine - PRO
+ * - Accepts MOV/MP4 mixed inputs
+ * - Normalizes each clip to a strict standard
+ * - Guarantees audio track (injects silence if missing)
+ * - Concats normalized clips reliably
+ * - Rate-limits concurrent jobs (Railway stability)
+ */
+
 const express = require("express");
 const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 const https = require("https");
 const http = require("http");
+const crypto = require("crypto");
 
 const app = express();
-app.use(express.json({ limit: "50mb" }));
+app.use(express.json({ limit: "2mb" }));
 
-app.get("/", (req, res) => res.json({ status: "ok" }));
-
-app.post("/concat", async (req, res) => {
-  const jobId = `job-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
-  try {
-    // ===== AUTH =====
-    const apiKey = req.headers["x-api-key"];
-    if (!process.env.API_KEY) {
-      return res.status(500).json({ error: "Server missing API_KEY env var" });
-    }
-    if (apiKey !== process.env.API_KEY) {
-      return res.status(401).json({ error: "Unauthorized" });
-    }
-
-    // ===== BODY =====
-    const { videos, output_name } = req.body;
-    if (!Array.isArray(videos) || videos.length < 2) {
-      return res.status(400).json({ error: "At least 2 video URLs required" });
-    }
-
-    // ===== TMP =====
-    const tmpDir = path.join("/tmp", jobId);
-    fs.mkdirSync(tmpDir, { recursive: true });
-
-    const cleanup = () => {
-      try {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-      } catch {}
-    };
-    res.on("close", cleanup);
-    res.on("finish", cleanup);
-
-    // ===== DOWNLOAD =====
-    const inputPaths = [];
-    for (let i = 0; i < videos.length; i++) {
-      const inputPath = path.join(tmpDir, `input${i}.mp4`);
-      await downloadFile(videos[i], inputPath);
-      inputPaths.push(inputPath);
-      console.log(`[${jobId}] Downloaded input${i}.mp4`);
-    }
-
-    // ===== PROBE (duração + tem áudio?) =====
-    const metas = [];
-    for (let i = 0; i < inputPaths.length; i++) {
-      const meta = await probeFile(inputPaths[i]);
-      metas.push(meta);
-      console.log(
-        `[${jobId}] input${i}: duration=${meta.duration}s hasAudio=${meta.hasAudio}`
-      );
-    }
-
-    // ===== OUTPUT =====
-    const outName = sanitizeFileName(output_name || "output");
-    const outputPath = path.join(tmpDir, "output.mp4");
-
-    // ===== FFMPEG BUILD =====
-    const ffArgs = ["-y"];
-    inputPaths.forEach((p) => ffArgs.push("-i", p));
-
-    let filter = "";
-    let concatInputs = ""; // <- VAI SER INTERCALADO [v0][a0][v1][a1]...
-
-    for (let i = 0; i < metas.length; i++) {
-      // vídeo: pad + fps + formato + sar
-      filter +=
-        `[${i}:v]` +
-        `scale=1080:1920:force_original_aspect_ratio=decrease,` +
-        `pad=1080:1920:(ow-iw)/2:(oh-ih)/2,` +
-        `fps=30,format=yuv420p,setsar=1` +
-        `[v${i}];`;
-
-      // áudio: se não tiver, cria silêncio com mesma duração
-      if (metas[i].hasAudio) {
-        filter +=
-          `[${i}:a]` +
-          `aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,` +
-          `aresample=async=1` +
-          `[a${i}];`;
-      } else {
-        const dur = Math.max(0.1, metas[i].duration || 1);
-        filter +=
-          `anullsrc=channel_layout=stereo:sample_rate=44100,` +
-          `atrim=0:${dur},asetpts=N/SR/TB` +
-          `[a${i}];`;
-      }
-
-      // ✅ MUITO IMPORTANTE: concatInputs INTERCALADO
-      concatInputs += `[v${i}][a${i}]`;
-    }
-
-    // ✅ concat correto (ordem intercalada)
-    filter += `${concatInputs}concat=n=${metas.length}:v=1:a=1[vout][aout]`;
-
-    ffArgs.push(
-      "-filter_complex", filter,
-      "-map", "[vout]",
-      "-map", "[aout]",
-      "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-crf", "23",
-      "-pix_fmt", "yuv420p",
-      "-c:a", "aac",
-      "-b:a", "128k",
-      "-ar", "44100",
-      "-ac", "2",
-      "-movflags", "+faststart",
-      outputPath
-    );
-
-    console.log(`[${jobId}] Running ffmpeg...`);
-    const { code, stderrTail } = await runSpawnCapture("ffmpeg", ffArgs);
-
-    if (code !== 0) {
-      console.error(`[${jobId}] ffmpeg failed code=${code}`);
-      console.error(stderrTail);
-
-      return res.status(500).json({
-        error: "FFmpeg processing failed",
-        details: "ffmpeg exited with non-zero code",
-        ffmpeg_stderr_tail: stderrTail,
-      });
-    }
-
-    // ✅ força download (não abrir em nova aba)
-    res.setHeader("Content-Type", "application/octet-stream");
-    res.setHeader("Content-Disposition", `attachment; filename="${outName}.mp4"`);
-
-    return res.download(outputPath, `${outName}.mp4`);
-  } catch (err) {
-    console.error(`[${jobId}] Server error:`, err);
-    return res.status(500).json({
-      error: "Server error",
-      details: err?.message || String(err),
-    });
-  }
+// CORS (ok for internal use; if you want, restrict to your domain)
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-api-key");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
 });
 
-function sanitizeFileName(name) {
-  return String(name).replace(/[^a-zA-Z0-9_\-\.]/g, "_");
-}
+const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.API_KEY || "";
+const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 2);
+const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_MS || 12 * 60 * 1000);
+const DOWNLOAD_TIMEOUT_MS = Number(process.env.DOWNLOAD_TIMEOUT_MS || 3 * 60 * 1000);
+const DEFAULT_FPS = Number(process.env.DEFAULT_FPS || 30);
 
-function runSpawnCapture(cmd, args) {
-  return new Promise((resolve) => {
-    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+const TARGETS = {
+  "9:16": { w: 1080, h: 1920 },
+  "16:9": { w: 1920, h: 1080 },
+  "1:1": { w: 1080, h: 1080 },
+};
 
-    let stderr = "";
-    p.stdout.on("data", (d) => console.log(String(d)));
-    p.stderr.on("data", (d) => {
-      const s = String(d);
-      console.log(s);
-      stderr += s;
-      if (stderr.length > 20000) stderr = stderr.slice(-20000);
+// ---------- Simple semaphore ----------
+class Semaphore {
+  constructor(max) {
+    this.max = max;
+    this.current = 0;
+    this.queue = [];
+  }
+  acquire() {
+    return new Promise((resolve) => {
+      if (this.current < this.max) {
+        this.current++;
+        resolve();
+      } else {
+        this.queue.push(resolve);
+      }
     });
+  }
+  release() {
+    this.current = Math.max(0, this.current - 1);
+    const next = this.queue.shift();
+    if (next) {
+      this.current++;
+      next();
+    }
+  }
+}
+const sem = new Semaphore(MAX_CONCURRENT);
 
-    p.on("close", (code) => resolve({ code, stderrTail: stderr.slice(-4000) }));
-  });
+// ---------- Helpers ----------
+function safeFilename(name) {
+  const base = (name || "output")
+    .toString()
+    .trim()
+    .replace(/[^\w\-\.]+/g, "_")
+    .slice(0, 80);
+  return base.endsWith(".mp4") ? base : `${base}.mp4`;
 }
 
-function runSpawnToString(cmd, args) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let out = "";
-    let err = "";
-    p.stdout.on("data", (d) => (out += String(d)));
-    p.stderr.on("data", (d) => (err += String(d)));
-
-    p.on("close", (code) => {
-      if (code !== 0) return reject(new Error(err || `Exit ${code}`));
-      resolve(out);
-    });
-  });
+function mkTmpDir() {
+  const id = crypto.randomBytes(8).toString("hex");
+  const dir = path.join(os.tmpdir(), `job-${Date.now()}-${id}`);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
 }
 
-async function probeFile(filePath) {
-  const durStr = await runSpawnToString("ffprobe", [
-    "-v", "error",
-    "-show_entries", "format=duration",
-    "-of", "default=noprint_wrappers=1:nokey=1",
-    filePath,
-  ]).catch(() => "0");
-
-  const duration = Math.max(0, parseFloat(String(durStr).trim()) || 0);
-
-  const audioStr = await runSpawnToString("ffprobe", [
-    "-v", "error",
-    "-select_streams", "a:0",
-    "-show_entries", "stream=index",
-    "-of", "csv=p=0",
-    filePath,
-  ]).catch(() => "");
-
-  const hasAudio = String(audioStr).trim().length > 0;
-  return { duration, hasAudio };
+function cleanupDir(dir) {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {}
 }
 
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     const mod = url.startsWith("https") ? https : http;
-    const file = fs.createWriteStream(dest);
 
     const req = mod.get(url, (response) => {
+      // redirects
       if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        file.close();
+        response.resume();
         return downloadFile(response.headers.location, dest).then(resolve).catch(reject);
       }
 
       if (response.statusCode !== 200) {
-        file.close();
-        return reject(new Error(`Download failed (${response.statusCode}) for ${url}`));
+        response.resume();
+        return reject(new Error(`Download failed: HTTP ${response.statusCode}`));
       }
 
+      const file = fs.createWriteStream(dest);
       response.pipe(file);
+
       file.on("finish", () => file.close(resolve));
+      file.on("error", (err) => {
+        try { fs.unlinkSync(dest); } catch {}
+        reject(err);
+      });
     });
 
-    req.on("error", (err) => {
-      try { fs.unlinkSync(dest); } catch {}
+    req.setTimeout(DOWNLOAD_TIMEOUT_MS, () => {
+      req.destroy(new Error("Download timeout"));
+    });
+
+    req.on("error", reject);
+  });
+}
+
+function runFFmpeg(args, timeoutMs = JOB_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const p = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+
+    let stderr = "";
+    p.stderr.on("data", (d) => {
+      stderr += d.toString();
+      if (stderr.length > 20000) stderr = stderr.slice(-20000);
+    });
+
+    const t = setTimeout(() => {
+      p.kill("SIGKILL");
+      reject(new Error("FFmpeg timeout"));
+    }, timeoutMs);
+
+    p.on("error", (err) => {
+      clearTimeout(t);
       reject(err);
+    });
+
+    p.on("close", (code) => {
+      clearTimeout(t);
+      if (code === 0) return resolve();
+      reject(new Error(`ffmpeg exited with code ${code}\n${stderr}`));
     });
   });
 }
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`FFmpeg server running on port ${PORT}`));
+// Normaliza cada clip para um padrão único:
+// - resolução/fps fixos
+// - yuv420p
+// - setsar=1 (evita distorção / CTA “esticando”)
+// - H264 + AAC
+// - áudio garantido (anullsrc + shortest)
+async function normalizeClip(inputPath, outputPath, { w, h, fps }) {
+  const vf =
+    `scale=${w}:${h}:force_original_aspect_ratio=decrease,` +
+    `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,` +
+    `setsar=1,fps=${fps},format=yuv420p`;
+
+  const args = [
+    "-y",
+    "-i", inputPath,
+
+    // áudio silencioso (fallback)
+    "-f", "lavfi",
+    "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+
+    "-shortest",
+    "-vf", vf,
+
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-crf", "23",
+    "-pix_fmt", "yuv420p",
+
+    "-c:a", "aac",
+    "-b:a", "128k",
+    "-ar", "44100",
+    "-ac", "2",
+    "-af", "aresample=async=1:first_pts=0",
+
+    "-movflags", "+faststart",
+    outputPath,
+  ];
+
+  await runFFmpeg(args);
+}
+
+async function concatNormalized(listPath, outputPath) {
+  // Como já está tudo normalizado, concat + copy fica rápido e estável
+  const args = [
+    "-y",
+    "-f", "concat",
+    "-safe", "0",
+    "-i", listPath,
+    "-c", "copy",
+    "-movflags", "+faststart",
+    outputPath,
+  ];
+  await runFFmpeg(args);
+}
+
+// ---------- Routes ----------
+app.get("/", (req, res) => res.json({ status: "ok" }));
+
+app.post("/concat", async (req, res) => {
+  // Auth
+  const apiKey = req.headers["x-api-key"];
+  if (!API_KEY || apiKey !== API_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  await sem.acquire();
+
+  const tmpDir = mkTmpDir();
+  let cleaned = false;
+
+  const doCleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    cleanupDir(tmpDir);
+    sem.release();
+  };
+
+  // se o cliente abortar, limpa
+  res.on("close", doCleanup);
+
+  try {
+    const { videos, output_name, format, fps } = req.body;
+
+    if (!Array.isArray(videos) || videos.length < 2) {
+      doCleanup();
+      return res.status(400).json({ error: "At least 2 video URLs required" });
+    }
+
+    const chosen = TARGETS[format] || TARGETS["9:16"];
+    const target = { w: chosen.w, h: chosen.h, fps: Number(fps || DEFAULT_FPS) };
+
+    // 1) download
+    const rawPaths = [];
+    for (let i = 0; i < videos.length; i++) {
+      const raw = path.join(tmpDir, `raw_${i}.bin`);
+      await downloadFile(videos[i], raw);
+      rawPaths.push(raw);
+    }
+
+    // 2) normalize
+    const normPaths = [];
+    for (let i = 0; i < rawPaths.length; i++) {
+      const norm = path.join(tmpDir, `norm_${i}.mp4`);
+      await normalizeClip(rawPaths[i], norm, target);
+      normPaths.push(norm);
+    }
+
+    // 3) list.txt
+    const listPath = path.join(tmpDir, "list.txt");
+    fs.writeFileSync(listPath, normPaths.map((p) => `file '${p}'`).join("\n"));
+
+    // 4) concat final
+    const outFile = safeFilename(output_name || "output");
+    const outputPath = path.join(tmpDir, "output.mp4");
+    await concatNormalized(listPath, outputPath);
+
+    if (!fs.existsSync(outputPath)) {
+      throw new Error("Output file not found after concat");
+    }
+
+    // 5) download (cleanup só depois)
+    res.download(outputPath, outFile, (err) => {
+      doCleanup();
+      if (err) console.error("Download error:", err.message);
+    });
+  } catch (err) {
+    console.error("Engine error:", err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Processing failed", details: err.message });
+    }
+    doCleanup();
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`FFmpeg engine running on port ${PORT}`);
+  console.log(`MAX_CONCURRENT=${MAX_CONCURRENT} DEFAULT_FPS=${DEFAULT_FPS}`);
+});
