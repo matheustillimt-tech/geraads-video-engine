@@ -8,7 +8,6 @@ const http = require("http");
 const app = express();
 app.use(express.json({ limit: "100mb" }));
 
-// HEALTH CHECK
 app.get("/", (req, res) => {
   res.json({ status: "ok" });
 });
@@ -40,9 +39,7 @@ app.post("/concat", async (req, res) => {
 
     const normalizedVideos = [];
 
-    // ===============================
     // DOWNLOAD + NORMALIZE
-    // ===============================
 
     for (let i = 0; i < videos.length; i++) {
 
@@ -53,14 +50,14 @@ app.post("/concat", async (req, res) => {
 
       await downloadFile(videos[i], rawPath);
 
-      console.log("Normalizing video:", i);
+      console.log("Normalizing:", i);
 
       execSync(
         `ffmpeg -y -i "${rawPath}" \
         -map_metadata -1 \
-        -vf "scale=1080:-2:flags=lanczos,fps=30,format=yuv420p" \
-        -c:v libx264 -preset fast -crf 23 \
-        -c:a aac -ar 44100 -b:a 128k \
+        -vf "scale=1080:-2,fps=30,format=yuv420p" \
+        -c:v libx264 -preset veryfast -crf 23 \
+        -an \
         -movflags +faststart \
         "${normalizedPath}"`,
         { stdio: "pipe", timeout: 300000 }
@@ -70,9 +67,7 @@ app.post("/concat", async (req, res) => {
 
     }
 
-    // ===============================
-    // CREATE CONCAT LIST
-    // ===============================
+    // CONCAT LIST
 
     const listPath = path.join(tmpDir, "list.txt");
 
@@ -82,13 +77,9 @@ app.post("/concat", async (req, res) => {
 
     fs.writeFileSync(listPath, concatList);
 
-    // ===============================
-    // CONCAT
-    // ===============================
-
     const outputPath = path.join(tmpDir, "output.mp4");
 
-    console.log("Concatenating videos...");
+    console.log("Concatenating");
 
     execSync(
       `ffmpeg -y -f concat -safe 0 -i "${listPath}" -c copy "${outputPath}"`,
@@ -96,10 +87,6 @@ app.post("/concat", async (req, res) => {
     );
 
     console.log("Render finished");
-
-    // ===============================
-    // SEND FILE
-    // ===============================
 
     await new Promise((resolve, reject) => {
 
@@ -123,10 +110,6 @@ app.post("/concat", async (req, res) => {
 
   } finally {
 
-    // ===============================
-    // CLEANUP
-    // ===============================
-
     try {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     } catch (e) {
@@ -136,10 +119,6 @@ app.post("/concat", async (req, res) => {
   }
 
 });
-
-// ===============================
-// DOWNLOAD FUNCTION
-// ===============================
 
 function downloadFile(url, dest) {
 
@@ -171,7 +150,6 @@ function downloadFile(url, dest) {
     }).on("error", (err) => {
 
       fs.unlink(dest, () => {});
-
       reject(err);
 
     });
@@ -179,10 +157,6 @@ function downloadFile(url, dest) {
   });
 
 }
-
-// ===============================
-// SERVER
-// ===============================
 
 const PORT = process.env.PORT || 3000;
 
