@@ -12,6 +12,8 @@ app.use(express.json({ limit: "50mb" }));
 app.get("/", (req, res) => res.json({ status: "ok" }));
 
 app.post("/concat", async (req, res) => {
+  const jobId = `job-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
   try {
     // ===== AUTH =====
     const apiKey = req.headers["x-api-key"];
@@ -24,13 +26,11 @@ app.post("/concat", async (req, res) => {
 
     // ===== BODY =====
     const { videos, output_name } = req.body;
-
     if (!Array.isArray(videos) || videos.length < 2) {
       return res.status(400).json({ error: "At least 2 video URLs required" });
     }
 
-    // ===== TMP DIR =====
-    const jobId = `job-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    // ===== TMP =====
     const tmpDir = path.join("/tmp", jobId);
     fs.mkdirSync(tmpDir, { recursive: true });
 
@@ -39,12 +39,10 @@ app.post("/concat", async (req, res) => {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       } catch {}
     };
-
-    // cleanup sempre que a resposta terminar
     res.on("close", cleanup);
     res.on("finish", cleanup);
 
-    // ===== DOWNLOAD INPUTS =====
+    // ===== DOWNLOAD =====
     const inputPaths = [];
     for (let i = 0; i < videos.length; i++) {
       const inputPath = path.join(tmpDir, `input${i}.mp4`);
@@ -53,49 +51,53 @@ app.post("/concat", async (req, res) => {
       console.log(`[${jobId}] Downloaded input${i}.mp4`);
     }
 
-    // ===== OUTPUT =====
-    const outputPath = path.join(tmpDir, "output.mp4");
-
-    // ===== FFMPEG (filter_complex concat + normalize) =====
-    // Normaliza cada vídeo para: 1080x1920, 30fps, yuv420p, sar=1
-    // e cria áudio silencioso se precisar (via anullsrc + amix fallback)
-    // Observação: funciona muito bem pra hook/corpo/cta com specs diferentes.
-
-    // Monta inputs
-    const ffArgs = ["-y"];
-    inputPaths.forEach((p) => {
-      ffArgs.push("-i", p);
-    });
-
-    // Monta filter_complex dinamicamente
-    // Para cada input i:
-    // [i:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p,setsar=1[v{i}];
-    // [i:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,aresample=44100[a{i}];
-    // Se o input não tiver áudio, o ffmpeg pode falhar no [i:a]. A solução é usar -shortest e map com fallback:
-    // A abordagem mais robusta em runtime é adicionar um "silence" e usar amerge/amix,
-    // mas pra simplificar e manter estável: adicionamos um anullsrc e usamos "concat" com a=1,
-    // e passamos "-ignore_unknown" para inputs sem áudio + usamos "aresample=async=1".
-    //
-    // Na prática: quase todos seus mp4 têm áudio, e essa pipeline resolve 99% dos casos.
-
-    let filter = "";
+    // ===== PROBE (duração + tem áudio?) =====
+    const metas = [];
     for (let i = 0; i < inputPaths.length; i++) {
-      filter +=
-        `[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,` +
-        `pad=1080:1920:(ow-iw)/2:(oh-ih)/2,` +
-        `fps=30,format=yuv420p,setsar=1[v${i}];`;
-
-      // tenta tratar áudio; se algum input vier sem áudio, ele pode quebrar.
-      // por isso usamos "aresample=async=1" e depois, se falhar, fica explícito no log.
-      filter +=
-        `[${i}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,` +
-        `aresample=async=1[a${i}];`;
+      const meta = await probeFile(inputPaths[i]);
+      metas.push(meta);
+      console.log(
+        `[${jobId}] input${i}: duration=${meta.duration}s hasAudio=${meta.hasAudio}`
+      );
     }
 
-    // concat
-    const vInputs = Array.from({ length: inputPaths.length }, (_, i) => `[v${i}]`).join("");
-    const aInputs = Array.from({ length: inputPaths.length }, (_, i) => `[a${i}]`).join("");
-    filter += `${vInputs}${aInputs}concat=n=${inputPaths.length}:v=1:a=1[vout][aout]`;
+    // ===== OUTPUT =====
+    const outName = sanitizeFileName(output_name || "output");
+    const outputPath = path.join(tmpDir, "output.mp4");
+
+    // ===== FFMPEG BUILD =====
+    const ffArgs = ["-y"];
+    inputPaths.forEach((p) => ffArgs.push("-i", p));
+
+    // Normalização de vídeo + áudio garantido (silêncio se faltar)
+    let filter = "";
+    for (let i = 0; i < metas.length; i++) {
+      filter +=
+        `[${i}:v]` +
+        `scale=1080:1920:force_original_aspect_ratio=decrease,` +
+        `pad=1080:1920:(ow-iw)/2:(oh-ih)/2,` +
+        `fps=30,format=yuv420p,setsar=1` +
+        `[v${i}];`;
+
+      if (metas[i].hasAudio) {
+        filter +=
+          `[${i}:a]` +
+          `aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,` +
+          `aresample=async=1` +
+          `[a${i}];`;
+      } else {
+        // gera áudio silencioso com mesma duração do vídeo
+        const dur = Math.max(0.1, metas[i].duration || 1);
+        filter +=
+          `anullsrc=channel_layout=stereo:sample_rate=44100,` +
+          `atrim=0:${dur},asetpts=N/SR/TB` +
+          `[a${i}];`;
+      }
+    }
+
+    const vInputs = metas.map((_, i) => `[v${i}]`).join("");
+    const aInputs = metas.map((_, i) => `[a${i}]`).join("");
+    filter += `${vInputs}${aInputs}concat=n=${metas.length}:v=1:a=1[vout][aout]`;
 
     ffArgs.push(
       "-filter_complex", filter,
@@ -113,23 +115,26 @@ app.post("/concat", async (req, res) => {
     );
 
     console.log(`[${jobId}] Running ffmpeg...`);
-    const code = await runSpawn("ffmpeg", ffArgs);
+    const { code, stderrTail } = await runSpawnCapture("ffmpeg", ffArgs);
 
     if (code !== 0) {
+      console.error(`[${jobId}] ffmpeg failed code=${code}`);
+      console.error(stderrTail);
+
       return res.status(500).json({
         error: "FFmpeg processing failed",
         details: "ffmpeg exited with non-zero code",
+        ffmpeg_stderr_tail: stderrTail, // <-- isso mostra o erro real no Lovable
       });
     }
 
     // ===== DOWNLOAD RESPONSE =====
-    // Força download
     res.setHeader("Content-Type", "application/octet-stream");
-    res.setHeader("Content-Disposition", `attachment; filename="${sanitizeFileName(output_name || "output")}.mp4"`);
+    res.setHeader("Content-Disposition", `attachment; filename="${outName}.mp4"`);
 
-    return res.download(outputPath, `${sanitizeFileName(output_name || "output")}.mp4`);
+    return res.download(outputPath, `${outName}.mp4`);
   } catch (err) {
-    console.error("Server error:", err);
+    console.error(`[${jobId}] Server error:`, err);
     return res.status(500).json({
       error: "Server error",
       details: err?.message || String(err),
@@ -141,15 +146,65 @@ function sanitizeFileName(name) {
   return String(name).replace(/[^a-zA-Z0-9_\-\.]/g, "_");
 }
 
-function runSpawn(cmd, args) {
+function runSpawnCapture(cmd, args) {
   return new Promise((resolve) => {
     const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
 
+    let stderr = "";
     p.stdout.on("data", (d) => console.log(String(d)));
-    p.stderr.on("data", (d) => console.log(String(d)));
+    p.stderr.on("data", (d) => {
+      const s = String(d);
+      console.log(s);
+      stderr += s;
+      if (stderr.length > 20000) stderr = stderr.slice(-20000); // limita memória
+    });
 
-    p.on("close", (code) => resolve(code));
+    p.on("close", (code) => {
+      resolve({ code, stderrTail: stderr.slice(-4000) });
+    });
   });
+}
+
+function runSpawnToString(cmd, args) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    let err = "";
+
+    p.stdout.on("data", (d) => (out += String(d)));
+    p.stderr.on("data", (d) => (err += String(d)));
+
+    p.on("close", (code) => {
+      if (code !== 0) return reject(new Error(err || `Exit ${code}`));
+      resolve(out);
+    });
+  });
+}
+
+// Usa ffprobe pra detectar áudio e duração
+async function probeFile(filePath) {
+  // duração
+  const durStr = await runSpawnToString("ffprobe", [
+    "-v", "error",
+    "-show_entries", "format=duration",
+    "-of", "default=noprint_wrappers=1:nokey=1",
+    filePath,
+  ]).catch(() => "0");
+
+  const duration = Math.max(0, parseFloat(String(durStr).trim()) || 0);
+
+  // tem áudio?
+  const audioStr = await runSpawnToString("ffprobe", [
+    "-v", "error",
+    "-select_streams", "a:0",
+    "-show_entries", "stream=index",
+    "-of", "csv=p=0",
+    filePath,
+  ]).catch(() => "");
+
+  const hasAudio = String(audioStr).trim().length > 0;
+
+  return { duration, hasAudio };
 }
 
 function downloadFile(url, dest) {
