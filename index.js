@@ -1,294 +1,432 @@
-/**
- * GeraAds Video Engine - PRO
- * - Accepts MOV/MP4 mixed inputs
- * - Normalizes each clip to a strict standard
- * - Guarantees audio track (injects silence if missing)
- * - Concats normalized clips reliably
- * - Rate-limits concurrent jobs (Railway stability)
- */
+// index.js — FFmpeg Concat Server (Railway)
+// Requisitos: FFmpeg + FFprobe instalados na imagem/ambiente do Railway
+// ENV:
+//   API_KEY = sua chave (ex: matheusgeraads)
+//   PORT    = porta do Railway (já vem automático)
 
 const express = require("express");
-const { spawn } = require("child_process");
+const { spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
-const os = require("os");
 const https = require("https");
 const http = require("http");
-const crypto = require("crypto");
+const { URL } = require("url");
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "50mb" }));
 
-// CORS (ok for internal use; if you want, restrict to your domain)
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-api-key");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
-
+/** =========================
+ *  CONFIG
+ *  ========================= */
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || "";
-const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 2);
-const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_MS || 12 * 60 * 1000);
-const DOWNLOAD_TIMEOUT_MS = Number(process.env.DOWNLOAD_TIMEOUT_MS || 3 * 60 * 1000);
-const DEFAULT_FPS = Number(process.env.DEFAULT_FPS || 30);
+const JOB_TIMEOUT_MS = 10 * 60 * 1000; // 10 min (ajuste se quiser)
+const MAX_CONCURRENT_JOBS = Number(process.env.MAX_CONCURRENT_JOBS || 2); // profissional: limita carga
+let activeJobs = 0;
+const jobQueue = [];
 
-const TARGETS = {
-  "9:16": { w: 1080, h: 1920 },
-  "16:9": { w: 1920, h: 1080 },
-  "1:1": { w: 1080, h: 1080 },
-};
-
-// ---------- Simple semaphore ----------
-class Semaphore {
-  constructor(max) {
-    this.max = max;
-    this.current = 0;
-    this.queue = [];
-  }
-  acquire() {
-    return new Promise((resolve) => {
-      if (this.current < this.max) {
-        this.current++;
-        resolve();
-      } else {
-        this.queue.push(resolve);
-      }
-    });
-  }
-  release() {
-    this.current = Math.max(0, this.current - 1);
-    const next = this.queue.shift();
-    if (next) {
-      this.current++;
-      next();
-    }
-  }
-}
-const sem = new Semaphore(MAX_CONCURRENT);
-
-// ---------- Helpers ----------
-function safeFilename(name) {
-  const base = (name || "output")
-    .toString()
-    .trim()
-    .replace(/[^\w\-\.]+/g, "_")
-    .slice(0, 80);
-  return base.endsWith(".mp4") ? base : `${base}.mp4`;
-}
-
-function mkTmpDir() {
-  const id = crypto.randomBytes(8).toString("hex");
-  const dir = path.join(os.tmpdir(), `job-${Date.now()}-${id}`);
-  fs.mkdirSync(dir, { recursive: true });
-  return dir;
-}
-
-function cleanupDir(dir) {
-  try {
-    fs.rmSync(dir, { recursive: true, force: true });
-  } catch {}
-}
-
-function downloadFile(url, dest) {
+function enqueueJob(fn) {
   return new Promise((resolve, reject) => {
-    const mod = url.startsWith("https") ? https : http;
+    jobQueue.push({ fn, resolve, reject });
+    drainQueue();
+  });
+}
 
-    const req = mod.get(url, (response) => {
-      // redirects
-      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        response.resume();
-        return downloadFile(response.headers.location, dest).then(resolve).catch(reject);
-      }
-
-      if (response.statusCode !== 200) {
-        response.resume();
-        return reject(new Error(`Download failed: HTTP ${response.statusCode}`));
-      }
-
-      const file = fs.createWriteStream(dest);
-      response.pipe(file);
-
-      file.on("finish", () => file.close(resolve));
-      file.on("error", (err) => {
-        try { fs.unlinkSync(dest); } catch {}
-        reject(err);
+function drainQueue() {
+  while (activeJobs < MAX_CONCURRENT_JOBS && jobQueue.length) {
+    const item = jobQueue.shift();
+    activeJobs++;
+    item
+      .fn()
+      .then(item.resolve)
+      .catch(item.reject)
+      .finally(() => {
+        activeJobs--;
+        drainQueue();
       });
-    });
+  }
+}
 
-    req.setTimeout(DOWNLOAD_TIMEOUT_MS, () => {
-      req.destroy(new Error("Download timeout"));
-    });
+function safeName(name) {
+  return String(name || "output")
+    .replace(/[^\w.\-]+/g, "_")
+    .slice(0, 120);
+}
+
+function isUrl(str) {
+  try {
+    const u = new URL(str);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function run(cmd, args, opts = {}) {
+  const started = Date.now();
+  const res = spawnSync(cmd, args, {
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024 * 50,
+    timeout: opts.timeout ?? JOB_TIMEOUT_MS,
+  });
+
+  if (opts.log) {
+    console.log(`[run] ${cmd} ${args.join(" ")}`);
+  }
+
+  if (res.error) {
+    throw new Error(`${cmd} error: ${res.error.message}`);
+  }
+  if (res.status !== 0) {
+    const stderr = (res.stderr || "").trim();
+    const stdout = (res.stdout || "").trim();
+    throw new Error(
+      `${cmd} exited with code ${res.status}\n` +
+        (stderr ? `stderr:\n${stderr}\n` : "") +
+        (stdout ? `stdout:\n${stdout}\n` : "")
+    );
+  }
+
+  if (opts.time) {
+    console.log(`[run] done in ${Date.now() - started}ms`);
+  }
+
+  return res.stdout || "";
+}
+
+function ffprobeJson(filePath) {
+  const out = run("ffprobe", [
+    "-v",
+    "error",
+    "-print_format",
+    "json",
+    "-show_streams",
+    "-show_format",
+    filePath,
+  ]);
+  return JSON.parse(out);
+}
+
+function hasAudioStream(filePath) {
+  const info = ffprobeJson(filePath);
+  return (info.streams || []).some((s) => s.codec_type === "audio");
+}
+
+function getVideoStreamInfo(filePath) {
+  const info = ffprobeJson(filePath);
+  const v = (info.streams || []).find((s) => s.codec_type === "video");
+  return v || null;
+}
+
+/** =========================
+ *  DOWNLOAD (com redirect)
+ *  ========================= */
+function downloadFile(url, dest, redirectsLeft = 5) {
+  return new Promise((resolve, reject) => {
+    if (!isUrl(url)) return reject(new Error("Invalid URL"));
+
+    const mod = url.startsWith("https") ? https : http;
+    const req = mod.get(
+      url,
+      {
+        headers: {
+          // ajuda com alguns CDNs
+          "User-Agent": "geraads-video-engine/1.0",
+          Accept: "*/*",
+        },
+      },
+      (res) => {
+        const code = res.statusCode || 0;
+
+        // Redirect
+        if (code >= 300 && code < 400 && res.headers.location) {
+          if (redirectsLeft <= 0) {
+            return reject(new Error("Too many redirects"));
+          }
+          const nextUrl = new URL(res.headers.location, url).toString();
+          res.resume();
+          return downloadFile(nextUrl, dest, redirectsLeft - 1)
+            .then(resolve)
+            .catch(reject);
+        }
+
+        if (code < 200 || code >= 300) {
+          res.resume();
+          return reject(new Error(`Download failed: HTTP ${code}`));
+        }
+
+        const file = fs.createWriteStream(dest);
+        res.pipe(file);
+
+        file.on("finish", () => file.close(resolve));
+        file.on("error", (err) => {
+          try {
+            fs.unlinkSync(dest);
+          } catch {}
+          reject(err);
+        });
+      }
+    );
 
     req.on("error", reject);
-  });
-}
-
-function runFFmpeg(args, timeoutMs = JOB_TIMEOUT_MS) {
-  return new Promise((resolve, reject) => {
-    const p = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
-
-    let stderr = "";
-    p.stderr.on("data", (d) => {
-      stderr += d.toString();
-      if (stderr.length > 20000) stderr = stderr.slice(-20000);
-    });
-
-    const t = setTimeout(() => {
-      p.kill("SIGKILL");
-      reject(new Error("FFmpeg timeout"));
-    }, timeoutMs);
-
-    p.on("error", (err) => {
-      clearTimeout(t);
-      reject(err);
-    });
-
-    p.on("close", (code) => {
-      clearTimeout(t);
-      if (code === 0) return resolve();
-      reject(new Error(`ffmpeg exited with code ${code}\n${stderr}`));
+    req.setTimeout(120000, () => {
+      req.destroy(new Error("Download timeout"));
     });
   });
 }
 
-// Normaliza cada clip para um padrão único:
-// - resolução/fps fixos
-// - yuv420p
-// - setsar=1 (evita distorção / CTA “esticando”)
-// - H264 + AAC
-// - áudio garantido (anullsrc + shortest)
-async function normalizeClip(inputPath, outputPath, { w, h, fps }) {
-  const vf =
-    `scale=${w}:${h}:force_original_aspect_ratio=decrease,` +
-    `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,` +
-    `setsar=1,fps=${fps},format=yuv420p`;
-
-  const args = [
-    "-y",
-    "-i", inputPath,
-
-    // áudio silencioso (fallback)
-    "-f", "lavfi",
-    "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-
-    "-shortest",
-    "-vf", vf,
-
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-crf", "23",
-    "-pix_fmt", "yuv420p",
-
-    "-c:a", "aac",
-    "-b:a", "128k",
-    "-ar", "44100",
-    "-ac", "2",
-    "-af", "aresample=async=1:first_pts=0",
-
-    "-movflags", "+faststart",
-    outputPath,
-  ];
-
-  await runFFmpeg(args);
+/** =========================
+ *  FORMAT MAP (do seu app)
+ *  ========================= */
+function formatToWH(format) {
+  // Você disse que o app manda algo tipo 9:16 / 16:9 / 1:1
+  // Padrão: vertical 1080x1920
+  const f = String(format || "9:16").trim();
+  if (f === "16:9") return { w: 1920, h: 1080 };
+  if (f === "1:1") return { w: 1080, h: 1080 };
+  return { w: 1080, h: 1920 };
 }
 
-async function concatNormalized(listPath, outputPath) {
-  // Como já está tudo normalizado, concat + copy fica rápido e estável
-  const args = [
-    "-y",
-    "-f", "concat",
-    "-safe", "0",
-    "-i", listPath,
-    "-c", "copy",
-    "-movflags", "+faststart",
-    outputPath,
-  ];
-  await runFFmpeg(args);
+/** =========================
+ *  AUTH
+ *  ========================= */
+function auth(req, res, next) {
+  // Aceita: x-api-key: <chave>
+  const apiKey = req.headers["x-api-key"];
+  if (!API_KEY) return res.status(500).json({ error: "API_KEY not set on server" });
+  if (apiKey !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
+  return next();
 }
 
-// ---------- Routes ----------
+/** =========================
+ *  ROUTES
+ *  ========================= */
 app.get("/", (req, res) => res.json({ status: "ok" }));
 
-app.post("/concat", async (req, res) => {
-  // Auth
-  const apiKey = req.headers["x-api-key"];
-  if (!API_KEY || apiKey !== API_KEY) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
-  await sem.acquire();
-
-  const tmpDir = mkTmpDir();
-  let cleaned = false;
-
-  const doCleanup = () => {
-    if (cleaned) return;
-    cleaned = true;
-    cleanupDir(tmpDir);
-    sem.release();
-  };
-
-  // se o cliente abortar, limpa
-  res.on("close", doCleanup);
-
-  try {
-    const { videos, output_name, format, fps } = req.body;
+/**
+ * POST /concat
+ * headers: x-api-key
+ * body:
+ * {
+ *   "videos": ["https://...","https://...","https://..."],
+ *   "output_name": "G1K_G1C1A1_0403_....",
+ *   "format": "9:16" | "16:9" | "1:1"
+ * }
+ */
+app.post("/concat", auth, async (req, res) => {
+  // roda em fila (evita travar Railway)
+  return enqueueJob(async () => {
+    const { videos, output_name, format } = req.body || {};
 
     if (!Array.isArray(videos) || videos.length < 2) {
-      doCleanup();
-      return res.status(400).json({ error: "At least 2 video URLs required" });
+      res.status(400).json({ error: "At least 2 video URLs required" });
+      return;
     }
 
-    const chosen = TARGETS[format] || TARGETS["9:16"];
-    const target = { w: chosen.w, h: chosen.h, fps: Number(fps || DEFAULT_FPS) };
+    const safeOutput = safeName(output_name);
+    const { w, h } = formatToWH(format);
 
-    // 1) download
-    const rawPaths = [];
-    for (let i = 0; i < videos.length; i++) {
-      const raw = path.join(tmpDir, `raw_${i}.bin`);
-      await downloadFile(videos[i], raw);
-      rawPaths.push(raw);
+    const tmpDir = path.join("/tmp", `job-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    let cleaned = false;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      try {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      } catch {}
+    };
+
+    // MUITO IMPORTANTE:
+    // não apagar /tmp antes do download terminar
+    res.on("finish", cleanup);
+    res.on("close", cleanup);
+
+    try {
+      console.log(`[job] start: ${safeOutput} | videos=${videos.length} | format=${format || "9:16"}`);
+
+      // 1) Download inputs
+      const inputPaths = [];
+      for (let i = 0; i < videos.length; i++) {
+        const url = videos[i];
+        if (!isUrl(url)) throw new Error(`Invalid video URL at index ${i}`);
+        const inputPath = path.join(tmpDir, `input_${i}`);
+        // salva sem extensão (ffmpeg/ffprobe aceitam)
+        await downloadFile(url, inputPath);
+        inputPaths.push(inputPath);
+      }
+
+      // 2) Normalize todos para MESMO codec/params + COR correta (evita vermelho / HDR bug)
+      const normalizedPaths = [];
+
+      // filtro PRO: pad + fps + bt709 + yuv420p
+      const fps = 30;
+      const vf =
+        `scale=${w}:${h}:force_original_aspect_ratio=decrease,` +
+        `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,` +
+        `setsar=1,` +
+        `fps=${fps},` +
+        // ✅ CORREÇÃO DEFINITIVA do "avermelhado" / HDR / iPhone
+        `colorspace=all=bt709:iall=bt709,` +
+        `format=yuv420p`;
+
+      for (let i = 0; i < inputPaths.length; i++) {
+        const inFile = inputPaths[i];
+        const outFile = path.join(tmpDir, `norm_${i}.mp4`);
+
+        const audioExists = hasAudioStream(inFile);
+
+        // Se não tiver áudio: injeta silêncio (para não quebrar concat / player)
+        // Se tiver áudio: usa o áudio original normalizado
+        if (!audioExists) {
+          run(
+            "ffmpeg",
+            [
+              "-y",
+              "-i",
+              inFile,
+              "-f",
+              "lavfi",
+              "-i",
+              "anullsrc=channel_layout=stereo:sample_rate=44100",
+              "-vf",
+              vf,
+              "-c:v",
+              "libx264",
+              "-preset",
+              "veryfast",
+              "-crf",
+              "23",
+              "-pix_fmt",
+              "yuv420p",
+              // tags de cor (ajudam players)
+              "-color_primaries",
+              "bt709",
+              "-color_trc",
+              "bt709",
+              "-colorspace",
+              "bt709",
+              "-map",
+              "0:v:0",
+              "-map",
+              "1:a:0",
+              "-shortest",
+              "-c:a",
+              "aac",
+              "-b:a",
+              "128k",
+              "-ar",
+              "44100",
+              "-ac",
+              "2",
+              "-movflags",
+              "+faststart",
+              outFile,
+            ],
+            { timeout: JOB_TIMEOUT_MS }
+          );
+        } else {
+          run(
+            "ffmpeg",
+            [
+              "-y",
+              "-i",
+              inFile,
+              "-vf",
+              vf,
+              "-c:v",
+              "libx264",
+              "-preset",
+              "veryfast",
+              "-crf",
+              "23",
+              "-pix_fmt",
+              "yuv420p",
+              "-color_primaries",
+              "bt709",
+              "-color_trc",
+              "bt709",
+              "-colorspace",
+              "bt709",
+              // áudio “estável” (evita drift / cortes)
+              "-c:a",
+              "aac",
+              "-b:a",
+              "128k",
+              "-ar",
+              "44100",
+              "-ac",
+              "2",
+              "-af",
+              "aresample=async=1:first_pts=0",
+              "-movflags",
+              "+faststart",
+              outFile,
+            ],
+            { timeout: JOB_TIMEOUT_MS }
+          );
+        }
+
+        normalizedPaths.push(outFile);
+      }
+
+      // 3) Concat (agora dá pra fazer -c copy sem mismatch)
+      const listPath = path.join(tmpDir, "list.txt");
+      fs.writeFileSync(
+        listPath,
+        normalizedPaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join("\n"),
+        "utf8"
+      );
+
+      const outputPath = path.join(tmpDir, "output.mp4");
+
+      run(
+        "ffmpeg",
+        [
+          "-y",
+          "-f",
+          "concat",
+          "-safe",
+          "0",
+          "-i",
+          listPath,
+          "-c",
+          "copy",
+          outputPath,
+        ],
+        { timeout: JOB_TIMEOUT_MS }
+      );
+
+      // sanity check
+      if (!fs.existsSync(outputPath)) {
+        throw new Error("Output file was not created");
+      }
+
+      // 4) Download (força attachment)
+      // OBS: o download automático no front depende de como você dispara o request.
+      // Do lado do servidor aqui fica certinho.
+      res.setHeader("Content-Type", "video/mp4");
+      res.setHeader("Content-Disposition", `attachment; filename="${safeOutput}.mp4"`);
+
+      return await new Promise((resolve, reject) => {
+        res.download(outputPath, `${safeOutput}.mp4`, (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+    } catch (err) {
+      console.error("[job] error:", err?.message || err);
+      // se já começou a responder arquivo, não dá pra mandar json
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: "FFmpeg processing failed",
+          details: err?.message || String(err),
+        });
+      }
+      cleanup();
     }
-
-    // 2) normalize
-    const normPaths = [];
-    for (let i = 0; i < rawPaths.length; i++) {
-      const norm = path.join(tmpDir, `norm_${i}.mp4`);
-      await normalizeClip(rawPaths[i], norm, target);
-      normPaths.push(norm);
-    }
-
-    // 3) list.txt
-    const listPath = path.join(tmpDir, "list.txt");
-    fs.writeFileSync(listPath, normPaths.map((p) => `file '${p}'`).join("\n"));
-
-    // 4) concat final
-    const outFile = safeFilename(output_name || "output");
-    const outputPath = path.join(tmpDir, "output.mp4");
-    await concatNormalized(listPath, outputPath);
-
-    if (!fs.existsSync(outputPath)) {
-      throw new Error("Output file not found after concat");
-    }
-
-    // 5) download (cleanup só depois)
-    res.download(outputPath, outFile, (err) => {
-      doCleanup();
-      if (err) console.error("Download error:", err.message);
-    });
-  } catch (err) {
-    console.error("Engine error:", err.message);
-    if (!res.headersSent) {
-      res.status(500).json({ error: "Processing failed", details: err.message });
-    }
-    doCleanup();
-  }
+  });
 });
 
-app.listen(PORT, () => {
-  console.log(`FFmpeg engine running on port ${PORT}`);
-  console.log(`MAX_CONCURRENT=${MAX_CONCURRENT} DEFAULT_FPS=${DEFAULT_FPS}`);
-});
+app.listen(PORT, () => console.log(`FFmpeg server running on port ${PORT}`));
