@@ -27,12 +27,22 @@ app.post("/concat", async (req, res) => {
   fs.mkdirSync(tmpDir, { recursive: true });
 
   try {
-    // 1. Download all videos
-    for (let i = 0; i < videos.length; i++) {
-      const filePath = path.join(tmpDir, `input${i}.mp4`);
-      await downloadFile(videos[i], filePath);
-      console.log(`Downloaded: input${i}.mp4`);
-    }
+    // 1. Download + convert videos
+for (let i = 0; i < videos.length; i++) {
+
+  const originalPath = path.join(tmpDir, `raw${i}.mp4`);
+  const convertedPath = path.join(tmpDir, `input${i}.mp4`);
+
+  await downloadFile(videos[i], originalPath);
+  console.log(`Downloaded raw${i}.mp4`);
+
+  execSync(
+    `ffmpeg -y -i "${originalPath}" -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k "${convertedPath}"`,
+    { stdio: "pipe", timeout: 300000 }
+  );
+
+  console.log(`Converted input${i}.mp4`);
+}
 
     // 2. Create concat list
     const concatList = videos
