@@ -50,7 +50,6 @@ app.post("/concat", async (req, res) => {
   -af "aresample=async=1" -movflags +faststart "${outputPath}"`,
   { stdio: "pipe", timeout: 300000 }
 );
-);
     );
     console.log(`Concatenated: ${output_name}`);
 
