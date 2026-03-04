@@ -44,8 +44,12 @@ app.post("/concat", async (req, res) => {
     // 3. Concatenate with FFmpeg
     const outputPath = path.join(tmpDir, "output.mp4");
     execSync(
-      `ffmpeg -f concat -safe 0 -i "${listPath}" -c copy "${outputPath}"`,
-      { stdio: "pipe", timeout: 300000 }
+  `ffmpeg -y -f concat -safe 0 -i "${listPath}" \
+  -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p \
+  -c:a aac -b:a 128k -ar 44100 -ac 2 \
+  -af "aresample=async=1" -movflags +faststart "${outputPath}"`,
+  { stdio: "pipe", timeout: 300000 }
+);
     );
     console.log(`Concatenated: ${output_name}`);
 
