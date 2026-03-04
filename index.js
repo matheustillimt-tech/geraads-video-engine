@@ -35,73 +35,44 @@ app.post("/concat", async (req, res) => {
 
   try {
 
-    console.log("Starting job:", jobId);
+    const localVideos = [];
 
-    const normalizedVideos = [];
-
-    // DOWNLOAD + NORMALIZE
-
+    // DOWNLOAD DOS VÍDEOS
     for (let i = 0; i < videos.length; i++) {
 
-      const rawPath = path.join(tmpDir, `raw_${i}.mp4`);
-      const normalizedPath = path.join(tmpDir, `input_${i}.mp4`);
+      const filePath = path.join(tmpDir, `input${i}.mp4`);
 
-      console.log("Downloading:", videos[i]);
+      await downloadFile(videos[i], filePath);
 
-      await downloadFile(videos[i], rawPath);
-
-      console.log("Normalizing:", i);
-
-      execSync(
-        `ffmpeg -y -i "${rawPath}" \
-        -map_metadata -1 \
-        -vf "scale=1080:-2,fps=30,format=yuv420p" \
-        -c:v libx264 -preset veryfast -crf 23 \
-        -an \
-        -movflags +faststart \
-        "${normalizedPath}"`,
-        { stdio: "pipe", timeout: 300000 }
-      );
-
-      normalizedVideos.push(normalizedPath);
+      localVideos.push(filePath);
 
     }
 
-    // CONCAT LIST
+    // CRIA LISTA DE CONCAT
+    const listFile = path.join(tmpDir, "list.txt");
 
-    const listPath = path.join(tmpDir, "list.txt");
-
-    const concatList = normalizedVideos
-      .map(v => `file '${v}'`)
-      .join("\n");
-
-    fs.writeFileSync(listPath, concatList);
-
-    const outputPath = path.join(tmpDir, "output.mp4");
-
-    console.log("Concatenating");
-
-    execSync(
-      `ffmpeg -y -f concat -safe 0 -i "${listPath}" -c copy "${outputPath}"`,
-      { stdio: "pipe", timeout: 300000 }
+    fs.writeFileSync(
+      listFile,
+      localVideos.map(v => `file '${v}'`).join("\n")
     );
 
-    console.log("Render finished");
+    const output = path.join(tmpDir, "output.mp4");
 
-    await new Promise((resolve, reject) => {
+    // CONCAT + CONVERT EM UMA OPERAÇÃO
+    execSync(
+      `ffmpeg -y -f concat -safe 0 -i "${listFile}" \
+      -vf "scale=1080:-2,fps=30,format=yuv420p" \
+      -c:v libx264 -preset ultrafast -crf 28 \
+      -an \
+      "${output}"`,
+      { stdio: "ignore" }
+    );
 
-      res.download(outputPath, `${output_name}.mp4`, (err) => {
-
-        if (err) reject(err);
-        else resolve();
-
-      });
-
-    });
+    res.download(output, `${output_name}.mp4`);
 
   } catch (error) {
 
-    console.error("FFmpeg error:", error.message);
+    console.error(error);
 
     res.status(500).json({
       error: "FFmpeg processing failed",
@@ -112,9 +83,7 @@ app.post("/concat", async (req, res) => {
 
     try {
       fs.rmSync(tmpDir, { recursive: true, force: true });
-    } catch (e) {
-      console.log("Cleanup failed");
-    }
+    } catch {}
 
   }
 
@@ -128,7 +97,7 @@ function downloadFile(url, dest) {
 
     const file = fs.createWriteStream(dest);
 
-    mod.get(url, (response) => {
+    mod.get(url, response => {
 
       if (
         response.statusCode >= 300 &&
@@ -147,7 +116,7 @@ function downloadFile(url, dest) {
         resolve();
       });
 
-    }).on("error", (err) => {
+    }).on("error", err => {
 
       fs.unlink(dest, () => {});
       reject(err);
