@@ -50,17 +50,17 @@ app.post("/concat", async (req, res) => {
   -af "aresample=async=1" -movflags +faststart "${outputPath}"`,
   { stdio: "pipe", timeout: 300000 }
 );
+);
     );
     console.log(`Concatenated: ${output_name}`);
 
-    // 4. Stream output directly to response
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Disposition", `attachment; filename="${output_name}.mp4"`);
-    const stream = fs.createReadStream(outputPath);
-    stream.pipe(res);
+    //4. Send file download
     await new Promise((resolve, reject) => {
-      stream.on("end", resolve);
-      stream.on("error", reject);
+  res.download(outputPath, `${output_name}.mp4`, (err) => {
+    if (err) reject(err);
+    else resolve();
+  });
+
     });
   } catch (err) {
     console.error("FFmpeg error:", err.message);
