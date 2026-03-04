@@ -8,7 +8,7 @@ const http = require("http");
 const app = express();
 app.use(express.json({ limit: "100mb" }));
 
-// health check
+// HEALTH CHECK
 app.get("/", (req, res) => {
   res.json({ status: "ok" });
 });
@@ -36,12 +36,12 @@ app.post("/concat", async (req, res) => {
 
   try {
 
-    console.log("Starting render job:", jobId);
+    console.log("Starting job:", jobId);
 
     const normalizedVideos = [];
 
     // ===============================
-    // 1. DOWNLOAD + NORMALIZE VIDEOS
+    // DOWNLOAD + NORMALIZE
     // ===============================
 
     for (let i = 0; i < videos.length; i++) {
@@ -57,18 +57,21 @@ app.post("/concat", async (req, res) => {
 
       execSync(
         `ffmpeg -y -i "${rawPath}" \
+        -map_metadata -1 \
         -vf "scale=1080:-2:flags=lanczos,fps=30,format=yuv420p" \
         -c:v libx264 -preset fast -crf 23 \
         -c:a aac -ar 44100 -b:a 128k \
-        -movflags +faststart "${normalizedPath}"`,
+        -movflags +faststart \
+        "${normalizedPath}"`,
         { stdio: "pipe", timeout: 300000 }
       );
 
       normalizedVideos.push(normalizedPath);
+
     }
 
     // ===============================
-    // 2. CREATE CONCAT LIST
+    // CREATE CONCAT LIST
     // ===============================
 
     const listPath = path.join(tmpDir, "list.txt");
@@ -80,7 +83,7 @@ app.post("/concat", async (req, res) => {
     fs.writeFileSync(listPath, concatList);
 
     // ===============================
-    // 3. CONCAT VIDEOS
+    // CONCAT
     // ===============================
 
     const outputPath = path.join(tmpDir, "output.mp4");
@@ -95,7 +98,7 @@ app.post("/concat", async (req, res) => {
     console.log("Render finished");
 
     // ===============================
-    // 4. SEND FILE
+    // SEND FILE
     // ===============================
 
     await new Promise((resolve, reject) => {
@@ -111,7 +114,7 @@ app.post("/concat", async (req, res) => {
 
   } catch (error) {
 
-    console.error("Render error:", error.message);
+    console.error("FFmpeg error:", error.message);
 
     res.status(500).json({
       error: "FFmpeg processing failed",
@@ -148,7 +151,6 @@ function downloadFile(url, dest) {
 
     mod.get(url, (response) => {
 
-      // redirect support
       if (
         response.statusCode >= 300 &&
         response.statusCode < 400 &&
@@ -185,5 +187,5 @@ function downloadFile(url, dest) {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log("FFmpeg render server running on port", PORT);
+  console.log("FFmpeg server running on port", PORT);
 });
