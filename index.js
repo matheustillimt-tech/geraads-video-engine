@@ -8,6 +8,7 @@ const http = require("http");
 const app = express();
 app.use(express.json({ limit: "100mb" }));
 
+// Health check
 app.get("/", (req, res) => {
   res.json({ status: "ok" });
 });
@@ -24,7 +25,7 @@ app.post("/concat", async (req, res) => {
 
   if (!videos || videos.length < 2) {
     return res.status(400).json({
-      error: "At least 2 video URLs required"
+      error: "At least 2 videos required"
     });
   }
 
@@ -35,9 +36,11 @@ app.post("/concat", async (req, res) => {
 
   try {
 
+    console.log("Starting job:", jobId);
+
     const localVideos = [];
 
-    // DOWNLOAD DOS VÍDEOS
+    // Download dos vídeos
     for (let i = 0; i < videos.length; i++) {
 
       const filePath = path.join(tmpDir, `input${i}.mp4`);
@@ -45,10 +48,9 @@ app.post("/concat", async (req, res) => {
       await downloadFile(videos[i], filePath);
 
       localVideos.push(filePath);
-
     }
 
-    // CRIA LISTA DE CONCAT
+    // Cria lista de concat
     const listFile = path.join(tmpDir, "list.txt");
 
     fs.writeFileSync(
@@ -58,21 +60,28 @@ app.post("/concat", async (req, res) => {
 
     const output = path.join(tmpDir, "output.mp4");
 
-    // CONCAT + CONVERT EM UMA OPERAÇÃO
+    console.log("Running FFmpeg...");
+
     execSync(
       `ffmpeg -y -f concat -safe 0 -i "${listFile}" \
       -vf "scale=1080:-2,fps=30,format=yuv420p" \
       -c:v libx264 -preset ultrafast -crf 28 \
       -an \
       "${output}"`,
-      { stdio: "ignore" }
+      { stdio: "pipe" }
     );
+
+    if (!fs.existsSync(output)) {
+      throw new Error("FFmpeg did not produce output file");
+    }
+
+    console.log("Render finished");
 
     res.download(output, `${output_name}.mp4`);
 
   } catch (error) {
 
-    console.error(error);
+    console.error("FFmpeg error:", error.message);
 
     res.status(500).json({
       error: "FFmpeg processing failed",
@@ -83,7 +92,9 @@ app.post("/concat", async (req, res) => {
 
     try {
       fs.rmSync(tmpDir, { recursive: true, force: true });
-    } catch {}
+    } catch (e) {
+      console.log("Cleanup failed");
+    }
 
   }
 
@@ -99,6 +110,7 @@ function downloadFile(url, dest) {
 
     mod.get(url, response => {
 
+      // suporte a redirect
       if (
         response.statusCode >= 300 &&
         response.statusCode < 400 &&
