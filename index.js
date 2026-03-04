@@ -8,6 +8,7 @@ const http = require("http");
 const app = express();
 app.use(express.json({ limit: "100mb" }));
 
+// Health check
 app.get("/", (req, res) => {
   res.json({ status: "ok" });
 });
@@ -30,6 +31,7 @@ app.post("/concat", async (req, res) => {
 
   const jobId = Date.now();
   const tmpDir = path.join("/tmp", `job-${jobId}`);
+
   fs.mkdirSync(tmpDir, { recursive: true });
 
   try {
@@ -50,6 +52,7 @@ app.post("/concat", async (req, res) => {
       localVideos.push(filePath);
     }
 
+    // cria lista para concat
     const listFile = path.join(tmpDir, "list.txt");
 
     fs.writeFileSync(
@@ -62,11 +65,7 @@ app.post("/concat", async (req, res) => {
     console.log("Running FFmpeg");
 
     execSync(
-      `ffmpeg -y -f concat -safe 0 -i "${listFile}" \
-      -vf "scale=1080:-2,fps=30" \
-      -c:v libx264 -preset ultrafast -crf 28 \
-      -an \
-      "${output}"`,
+      `ffmpeg -y -f concat -safe 0 -i "${listFile}" -vf "scale=1080:-2,fps=30" -c:v libx264 -preset ultrafast -crf 28 -an "${output}"`,
       { stdio: "inherit" }
     );
 
@@ -76,7 +75,19 @@ app.post("/concat", async (req, res) => {
 
     console.log("Render done");
 
-    res.download(output, `${output_name}.mp4`);
+    // DOWNLOAD DO VÍDEO
+    res.download(output, `${output_name}.mp4`, (err) => {
+
+      if (err) {
+        console.log("Download error:", err);
+      }
+
+      // limpa pasta depois do download
+      try {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      } catch {}
+
+    });
 
   } catch (error) {
 
@@ -86,8 +97,6 @@ app.post("/concat", async (req, res) => {
       error: "FFmpeg processing failed",
       details: error.message
     });
-
-  } finally {
 
     try {
       fs.rmSync(tmpDir, { recursive: true, force: true });
