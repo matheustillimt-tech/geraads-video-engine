@@ -6,13 +6,17 @@ const https = require("https");
 const http = require("http");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "100mb" }));
 
-// Health check
-app.get("/", (req, res) => res.json({ status: "ok" }));
+// health check
+app.get("/", (req, res) => {
+  res.json({ status: "ok" });
+});
 
 app.post("/concat", async (req, res) => {
+
   const apiKey = req.headers["x-api-key"];
+
   if (apiKey !== process.env.API_KEY) {
     return res.status(401).json({ error: "Unauthorized" });
   }
@@ -20,77 +24,131 @@ app.post("/concat", async (req, res) => {
   const { videos, output_name } = req.body;
 
   if (!videos || videos.length < 2) {
-    return res.status(400).json({ error: "At least 2 video URLs required" });
+    return res.status(400).json({
+      error: "At least 2 video URLs required"
+    });
   }
 
-  const tmpDir = path.join("/tmp", `job-${Date.now()}`);
+  const jobId = Date.now();
+  const tmpDir = path.join("/tmp", `job-${jobId}`);
+
   fs.mkdirSync(tmpDir, { recursive: true });
 
   try {
-    // 1. Download + convert videos
-for (let i = 0; i < videos.length; i++) {
 
-  const originalPath = path.join(tmpDir, `raw${i}.mp4`);
-  const convertedPath = path.join(tmpDir, `input${i}.mp4`);
+    console.log("Starting render job:", jobId);
 
-  await downloadFile(videos[i], originalPath);
-  console.log(`Downloaded raw${i}.mp4`);
+    const normalizedVideos = [];
 
-  execSync(
-    `ffmpeg -y -i "${originalPath}" -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k "${convertedPath}"`,
-    { stdio: "pipe", timeout: 300000 }
-  );
+    // ===============================
+    // 1. DOWNLOAD + NORMALIZE VIDEOS
+    // ===============================
 
-  console.log(`Converted input${i}.mp4`);
-}
+    for (let i = 0; i < videos.length; i++) {
 
-    // 2. Create concat list
-    const concatList = videos
-      .map((_, i) => `file '${path.join(tmpDir, `input${i}.mp4`)}'`)
-      .join("\n");
+      const rawPath = path.join(tmpDir, `raw_${i}.mp4`);
+      const normalizedPath = path.join(tmpDir, `input_${i}.mp4`);
+
+      console.log("Downloading:", videos[i]);
+
+      await downloadFile(videos[i], rawPath);
+
+      console.log("Normalizing video:", i);
+
+      execSync(
+        `ffmpeg -y -i "${rawPath}" \
+        -vf "scale=1080:-2:flags=lanczos,fps=30,format=yuv420p" \
+        -c:v libx264 -preset fast -crf 23 \
+        -c:a aac -ar 44100 -b:a 128k \
+        -movflags +faststart "${normalizedPath}"`,
+        { stdio: "pipe", timeout: 300000 }
+      );
+
+      normalizedVideos.push(normalizedPath);
+    }
+
+    // ===============================
+    // 2. CREATE CONCAT LIST
+    // ===============================
 
     const listPath = path.join(tmpDir, "list.txt");
+
+    const concatList = normalizedVideos
+      .map(v => `file '${v}'`)
+      .join("\n");
+
     fs.writeFileSync(listPath, concatList);
 
-    // 3. Concatenate with FFmpeg
+    // ===============================
+    // 3. CONCAT VIDEOS
+    // ===============================
+
     const outputPath = path.join(tmpDir, "output.mp4");
 
+    console.log("Concatenating videos...");
+
     execSync(
-      `ffmpeg -y -f concat -safe 0 -i "${listPath}" \
-      -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p \
-      -c:a aac -b:a 128k -ar 44100 -ac 2 \
-      -af "aresample=async=1" -movflags +faststart "${outputPath}"`,
+      `ffmpeg -y -f concat -safe 0 -i "${listPath}" -c copy "${outputPath}"`,
       { stdio: "pipe", timeout: 300000 }
     );
 
-    console.log(`Concatenated: ${output_name}`);
+    console.log("Render finished");
 
-    // 4. Send file download
+    // ===============================
+    // 4. SEND FILE
+    // ===============================
+
     await new Promise((resolve, reject) => {
+
       res.download(outputPath, `${output_name}.mp4`, (err) => {
+
         if (err) reject(err);
         else resolve();
+
       });
+
     });
 
-  } catch (err) {
-    console.error("FFmpeg error:", err.message);
+  } catch (error) {
+
+    console.error("Render error:", error.message);
+
     res.status(500).json({
       error: "FFmpeg processing failed",
-      details: err.message
+      details: error.message
     });
+
   } finally {
-    // Cleanup
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+
+    // ===============================
+    // CLEANUP
+    // ===============================
+
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch (e) {
+      console.log("Cleanup failed");
+    }
+
   }
+
 });
 
+// ===============================
+// DOWNLOAD FUNCTION
+// ===============================
+
 function downloadFile(url, dest) {
+
   return new Promise((resolve, reject) => {
+
     const mod = url.startsWith("https") ? https : http;
+
     const file = fs.createWriteStream(dest);
 
     mod.get(url, (response) => {
+
+      // redirect support
       if (
         response.statusCode >= 300 &&
         response.statusCode < 400 &&
@@ -109,14 +167,23 @@ function downloadFile(url, dest) {
       });
 
     }).on("error", (err) => {
+
       fs.unlink(dest, () => {});
+
       reject(err);
+
     });
+
   });
+
 }
+
+// ===============================
+// SERVER
+// ===============================
 
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`FFmpeg server running on port ${PORT}`);
+  console.log("FFmpeg render server running on port", PORT);
 });
